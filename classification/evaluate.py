@@ -70,8 +70,8 @@ class SoundGateInferencer:
         return apply_gate(probs[0])
 
 
-def run_noise_benchmark(inferencer, noise_dir: str = "data/noise",
-                        voice_dir: str = "data/voice"):
+def run_noise_benchmark(inferencer, noise_dir: str = "data_test/noise",
+                        voice_dir: str = "data_test/voice"):
     """Benchmark with progress bars."""
     noise_files = list(Path(noise_dir).glob("*.wav"))
     voice_files = list(Path(voice_dir).glob("*.wav"))

@@ -14,8 +14,8 @@ When triggered, GCC-PHAT localization runs using 3 microphones to estimate direc
 Performance Summary
 -------------------
 - Val accuracy: 99.00% | Val loss: 0.0338
-- Noise suppression (TEST SPLIT): 94.7% (536/566)
-- Voice trigger (TEST SPLIT):     99.3% (30574/30794)
+Noise suppression (TEST SPLIT): 93.9% (107/114)
+Voice trigger (TEST SPLIT): 98.7% (6076/6159)
 - Model size: 51 KB (INT8 quantized)
 - Estimated Peak SRAM usage: 213 KB (model + GCC-PHAT + buffers)
 
