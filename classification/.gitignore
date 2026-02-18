@@ -1,0 +1,15 @@
+# dataset directories
+data
+external
+
+# Bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+venv/
+
+# misc
+.ds_store
