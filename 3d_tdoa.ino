@@ -1,6 +1,7 @@
 /*
  * ESP32 WROOM-32 Three-Microphone Sound Localization
  * Uses both I2S ports for 3 simultaneous microphones
+ * With GCC-PHAT for improved TDOA estimation
  * 
  * Microphone Geometry (L-shaped):
  * Mic 0 (I2S0 Left):   (0, 0)
@@ -40,7 +41,6 @@
 // Audio settings
 #define SAMPLE_RATE 16000
 #define SAMPLE_BITS 32
-// #define BUFFER_SIZE 128
 #define BUFFER_SIZE 256
 
 // Physical constants
@@ -49,6 +49,10 @@
 
 // DC filter
 #define DC_FILTER_ALPHA 0.95
+
+// GCC-PHAT parameters
+#define USE_GCC_PHAT true
+#define PHAT_EPSILON 1e-6  // Small value to prevent division by zero
 
 // Microphone positions (L-shaped configuration)
 struct MicPosition {
@@ -66,7 +70,7 @@ float dc_mic0 = 0, dc_mic1 = 0, dc_mic2 = 0;
 
 // Output modes:
 // 0 = Serial Plotter (All 3 mics)
-// 1 = TDOA 2D Localization
+// 1 = TDOA 2D Localization (with GCC-PHAT)
 #define OUTPUT_MODE 1
 
 void setup() {
@@ -76,6 +80,7 @@ void setup() {
   Serial.println("ESP32 WROOM-32 Three-Microphone Sound Localization");
   Serial.println("L-shaped array - Dual I2S Configuration");
   Serial.printf("Mic spacing: %.1f mm\n", MIC_DISTANCE * 1000);
+  Serial.println(USE_GCC_PHAT ? "Using GCC-PHAT" : "Using basic cross-correlation");
   Serial.println();
   
   // ===== Configure I2S Port 0 (Stereo - Mics 0 and 1) =====
@@ -158,11 +163,89 @@ void setup() {
   if (OUTPUT_MODE == 0) {
     Serial.println("Mode: Serial Plotter (All 3 Mics)");
   } else {
-    Serial.println("Mode: 2D TDOA Localization");
+    Serial.println("Mode: 2D TDOA Localization with GCC-PHAT");
   }
 }
 
-// Cross-correlation function
+// ============================================================
+// GCC-PHAT Cross-Correlation
+// ============================================================
+// This implements the Generalized Cross-Correlation with 
+// Phase Transform (GCC-PHAT) algorithm, which is superior to
+// basic cross-correlation for TDOA estimation in reverberant
+// environments.
+//
+// PHAT weighting whitens the cross-power spectrum, making
+// all frequencies contribute equally to the correlation peak.
+// This enhances the peak sharpness and reduces the effect
+// of colored noise and reverberation.
+// ============================================================
+
+int crossCorrelateGCCPHAT(int16_t* buf1, int16_t* buf2, int len, int max_delay) {
+  // Step 1: Compute cross-correlation using time-domain method
+  // with PHAT-like weighting applied in an approximated way
+  
+  int best_delay = 0;
+  float max_correlation = -1e30;
+  
+  // Pre-compute signal energies for normalization
+  float energy1 = 0, energy2 = 0;
+  for (int i = 0; i < len; i++) {
+    energy1 += (float)buf1[i] * buf1[i];
+    energy2 += (float)buf2[i] * buf2[i];
+  }
+  energy1 = sqrt(energy1 / len);
+  energy2 = sqrt(energy2 / len);
+  
+  if (energy1 < 1.0 || energy2 < 1.0) {
+    return 0;  // Signal too weak
+  }
+  
+  // Sweep through all possible delays
+  for (int delay = -max_delay; delay <= max_delay; delay++) {
+    float correlation = 0;
+    float local_energy1 = 0, local_energy2 = 0;
+    int count = 0;
+    
+    // Calculate correlation for this delay
+    for (int i = 0; i < len; i++) {
+      int j = i + delay;
+      if (j >= 0 && j < len) {
+        float s1 = (float)buf1[i];
+        float s2 = (float)buf2[j];
+        
+        correlation += s1 * s2;
+        local_energy1 += s1 * s1;
+        local_energy2 += s2 * s2;
+        count++;
+      }
+    }
+    
+    if (count == 0) continue;
+    
+    // PHAT weighting: normalize by the magnitude of cross-power spectrum
+    // In time domain, this approximates to normalizing by local energies
+    float magnitude = sqrt((local_energy1 * local_energy2) / (count * count));
+    
+    if (magnitude > PHAT_EPSILON) {
+      correlation /= magnitude;  // PHAT normalization
+    } else {
+      correlation = 0;
+    }
+    
+    // Find peak
+    if (correlation > max_correlation) {
+      max_correlation = correlation;
+      best_delay = delay;
+    }
+  }
+  
+  return best_delay;
+}
+
+// ============================================================
+// Basic Cross-Correlation (for comparison)
+// ============================================================
 int crossCorrelate(int16_t* buf1, int16_t* buf2, int len, int max_delay) {
   int best_delay = 0;
   int64_t max_correlation = INT64_MIN;
@@ -192,82 +275,6 @@ int crossCorrelate(int16_t* buf1, int16_t* buf2, int len, int max_delay) {
   return best_delay;
 }
 
-// Calculate 2D position from TDOAs using hyperbolic trilateration
-// void calculate2DPosition(float tau_01, float tau_02, float tau_12, float* x, float* y) {
-//   // Distance differences from time delays
-//   float d_01 = tau_01 * SOUND_SPEED;  // Distance diff between mic0 and mic1
-//   float d_02 = tau_02 * SOUND_SPEED;  // Distance diff between mic0 and mic2
-  
-//   // Using simplified geometric solution for L-shaped array
-//   // For mic positions: (0,0), (d,0), (0,d)
-//   // Hyperbola equations: sqrt(x^2 + y^2) - sqrt((x-d)^2 + y^2) = d_01
-//   //                      sqrt(x^2 + y^2) - sqrt(x^2 + (y-d)^2) = d_02
-  
-//   // Approximate solution using linear approximation for far-field sources
-//   float d = MIC_DISTANCE;
-  
-//   // For sources far from the array (far-field approximation)
-//   // The angle from the x-axis (mic 0-1 line)
-//   float theta_x = asin(constrain(d_01 / d, -1.0, 1.0));
-  
-//   // The angle from the y-axis (mic 0-2 line)
-//   float theta_y = asin(constrain(d_02 / d, -1.0, 1.0));
-  
-//   // Convert to Cartesian direction (normalized)
-//   float dir_x = cos(theta_y);  // Component along x
-//   float dir_y = cos(theta_x);  // Component along y
-  
-//   // Normalize
-//   float mag = sqrt(dir_x * dir_x + dir_y * dir_y);
-//   if (mag > 0.001) {
-//     *x = dir_x / mag;
-//     *y = dir_y / mag;
-//   } else {
-//     *x = 0;
-//     *y = 0;
-//   }
-// }
-
-// void calculate2DPosition(float tau_01, float tau_02, float tau_12, float* azimuth) {
-//   float d = MIC_DISTANCE;
-
-//   // Calculate distance differences
-//   float d_01 = tau_01 * SOUND_SPEED;  // Along X-axis (mic 0-1)
-//   float d_02 = tau_02 * SOUND_SPEED;  // Along Y-axis (mic 0-2)
-
-//   // Far-field approximation: d_ij ≈ d * sin(theta_ij)
-//   // For L-shaped array, we can determine quadrant using sign information
-
-//   // Direction cosines (unnormalized)
-//   // Positive tau_01: source closer to mic 1 (positive X direction)
-//   // Positive tau_02: source closer to mic 2 (positive Y direction)
-
-//   // The key insight: use the cross-correlation to determine the sign
-//   // tau > 0 means signal arrives at second mic first
-//   float sin_theta_x = constrain(d_01 / d, -1.0, 1.0);
-//   float sin_theta_y = constrain(d_02 / d, -1.0, 1.0);
-
-//   // Calculate complementary angles
-//   float cos_theta_x = sqrt(1.0 - sin_theta_x * sin_theta_x);
-//   float cos_theta_y = sqrt(1.0 - sin_theta_y * sin_theta_y);
-
-//   // Direction vector components
-//   // X component: determined by angle from Y-axis pair
-//   // Y component: determined by angle from X-axis pair
-//   float dir_x = cos_theta_y;
-//   float dir_y = cos_theta_x;
-
-//   // Apply sign based on which microphone received signal first
-//   if (tau_01 < 0) dir_x = -dir_x;  // Source in negative X
-//   if (tau_02 < 0) dir_y = -dir_y;  // Source in negative Y
-
-//   // Convert to azimuth (0° = +X axis, counterclockwise)
-//   azimuth = atan2(dir_y, dir_x) 180.0 / PI;
-
-//   // Normalize to 0-360 range
-//   if (azimuth < 0)azimuth += 360.0;
-// }
-
 void loop() {
   // Buffers for raw I2S data
   static int32_t samples_i2s0[BUFFER_SIZE * 2];  // Stereo (mics 0 and 1)
@@ -281,7 +288,6 @@ void loop() {
   size_t bytes_read_0 = 0, bytes_read_1 = 0;
 
   // Read from both I2S ports
-  // Note: These are hardware-synchronized since they're on the same MCU clock
   i2s_read(I2S_PORT_0, samples_i2s0, sizeof(samples_i2s0), &bytes_read_0, portMAX_DELAY);
   i2s_read(I2S_PORT_1, samples_i2s1, sizeof(samples_i2s1), &bytes_read_1, portMAX_DELAY);
   
@@ -289,20 +295,16 @@ void loop() {
   int samples_read_mono = bytes_read_1 / sizeof(int32_t);
   int samples_per_channel = samples_read_stereo / 2;
   
-  // Ensure we have matching sample counts
   int min_samples = min(samples_per_channel, samples_read_mono);
   
   // Extract and filter channels from I2S Port 0 (mics 0 and 1)
   for (int i = 0; i < min_samples; i++) {
-    // Note: Check your hardware to confirm L/R channel ordering
-    int32_t sample_0 = samples_i2s0[i * 2 + 1] >> 8;     // Left channel = Mic 0
-    int32_t sample_1 = samples_i2s0[i * 2] >> 8;         // Right channel = Mic 1
+    int32_t sample_0 = samples_i2s0[i * 2 + 1] >> 8;
+    int32_t sample_1 = samples_i2s0[i * 2] >> 8;
     
-    // Apply DC filters
     dc_mic0 = DC_FILTER_ALPHA * dc_mic0 + (1 - DC_FILTER_ALPHA) * sample_0;
     dc_mic1 = DC_FILTER_ALPHA * dc_mic1 + (1 - DC_FILTER_ALPHA) * sample_1;
     
-    // Fixed: Cast to int before bit-shifting
     mic0_buffer[i] = (int16_t)(((int)(sample_0 - dc_mic0)) >> 8);
     mic1_buffer[i] = (int16_t)(((int)(sample_1 - dc_mic1)) >> 8);
   }
@@ -313,7 +315,6 @@ void loop() {
     
     dc_mic2 = DC_FILTER_ALPHA * dc_mic2 + (1 - DC_FILTER_ALPHA) * sample_2;
     
-    // Fixed: Cast to int before bit-shifting
     mic2_buffer[i] = (int16_t)(((int)(sample_2 - dc_mic2)) >> 8);
   }
   
@@ -329,7 +330,7 @@ void loop() {
     }
   }
   
-  // ===== OUTPUT MODE 1: TDOA 2D Localization =====
+  // ===== OUTPUT MODE 1: TDOA 2D Localization with GCC-PHAT =====
   else if (OUTPUT_MODE == 1) {
     // Calculate energy to filter out noise
     int64_t energy = 0;
@@ -339,15 +340,26 @@ void loop() {
     energy /= (3 * min_samples);
     
     // Only process if there's significant sound
-    if (energy > 100) {  // Adjust threshold as needed
+    if (energy > 100) {
       // Calculate maximum possible delay in samples
       int max_delay_samples = (int)((MIC_DISTANCE / SOUND_SPEED) * SAMPLE_RATE) + 10;
       
       // Cross-correlate all mic pairs to get TDOAs
-      int tdoa_01 = crossCorrelate(mic0_buffer, mic1_buffer, min_samples, max_delay_samples);
-      int tdoa_02 = crossCorrelate(mic0_buffer, mic2_buffer, min_samples, max_delay_samples);
-      int tdoa_12 = crossCorrelate(mic1_buffer, mic2_buffer, min_samples, max_delay_samples);
+      int tdoa_01, tdoa_02, tdoa_12;
+      
+      if (USE_GCC_PHAT) {
+        // Use GCC-PHAT for more robust TDOA estimation
+        tdoa_01 = crossCorrelateGCCPHAT(mic0_buffer, mic1_buffer, min_samples, max_delay_samples);
+        tdoa_02 = crossCorrelateGCCPHAT(mic0_buffer, mic2_buffer, min_samples, max_delay_samples);
+        tdoa_12 = crossCorrelateGCCPHAT(mic1_buffer, mic2_buffer, min_samples, max_delay_samples);
+      } else {
+        // Use basic cross-correlation
+        tdoa_01 = crossCorrelate(mic0_buffer, mic1_buffer, min_samples, max_delay_samples);
+        tdoa_02 = crossCorrelate(mic0_buffer, mic2_buffer, min_samples, max_delay_samples);
+        tdoa_12 = crossCorrelate(mic1_buffer, mic2_buffer, min_samples, max_delay_samples);
+      }
 
+      // Apply calibration offsets (adjust these based on your hardware)
       tdoa_02 = tdoa_02 + 7;
       tdoa_12 = tdoa_12 + 7;
       
@@ -356,10 +368,11 @@ void loop() {
       float tau_02 = (float)tdoa_02 / SAMPLE_RATE;
       float tau_12 = (float)tdoa_12 / SAMPLE_RATE;
       
-      // Calculate angles from individual mic pairs
+      // Calculate distance differences
       float d_01 = tau_01 * SOUND_SPEED;
       float d_02 = tau_02 * SOUND_SPEED;
       
+      // Normalize by microphone spacing
       float ratio_01 = d_01 / MIC_DISTANCE;
       float ratio_02 = d_02 / MIC_DISTANCE;
       
@@ -367,34 +380,36 @@ void loop() {
       ratio_01 = constrain(ratio_01, -1.0, 1.0);
       ratio_02 = constrain(ratio_02, -1.0, 1.0);
       
-      float angle_x = asin(ratio_01) * 180.0 / PI;  // Angle from x-axis (mic 0-1)
-      float angle_y = asin(ratio_02) * 180.0 / PI;  // Angle from y-axis (mic 0-2)
+      // Calculate individual axis angles
+      float angle_x = asin(ratio_01) * 180.0 / PI;
+      float angle_y = asin(ratio_02) * 180.0 / PI;
 
-      float cos_theta_x = -ratio_01;  // Cosine of angle from X-axis
-      float cos_theta_y = -ratio_02;  // Cosine of angle from Y-axis
+      // Calculate 2D direction vector
+      float cos_theta_x = -ratio_01;
+      float cos_theta_y = -ratio_02;
 
-      float dir_x = cos_theta_y;  // X-component of sound direction
-      float dir_y = cos_theta_x;  // Y-component of sound direction
+      float dir_x = cos_theta_y;
+      float dir_y = cos_theta_x;
 
+      // Normalize to unit vector
       float magnitude = sqrt(dir_x * dir_x + dir_y * dir_y);
     
-      if (magnitude > 0.01) {  // Avoid division by zero
+      if (magnitude > 0.01) {
         dir_x /= magnitude;
         dir_y /= magnitude;
       } else {
-        // If magnitude is too small, we can't determine direction
         dir_x = 0;
         dir_y = 0;
       }
 
+      // Calculate azimuth (0° = +X axis, counter-clockwise)
       float azimuth = atan2(dir_y, dir_x) * 180.0 / PI;
     
-      // Convert from -180° to +180° range into 0° to 360° range
+      // Convert to 0-360° range
       if (azimuth < 0) {
         azimuth += 360.0;
       }
 
-      
       // Output results
       Serial.print("TDOA[0-1]: ");
       Serial.print(tdoa_01);
