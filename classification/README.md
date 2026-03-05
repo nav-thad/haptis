@@ -121,7 +121,11 @@ Metrics Achieved So Far:
 
 ## 4. Live Test
 ------------
-python -c "from evaluate import SoundGateInferencer, live_demo; SoundGateInferencer().live_demo(15)"
+python3 -c "                                                                                        
+from evaluate import SoundGateInferencer, live_demo
+engine = SoundGateInferencer('model.tflite')
+live_demo(engine, n_windows=30)
+"
 
 
 ESP32-S3 Deployment 
